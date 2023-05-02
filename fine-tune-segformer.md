@@ -149,124 +149,112 @@ model = SegformerForSemanticSegmentation.from_pretrained(
 
 ## Set up the Trainer
 
-To fine-tune the model on our data, we'll use Hugging Face's [Trainer API](https://huggingface.co/docs/transformers/main_classes/trainer). We need to set up the training configuration and an evalutation metric to use a Trainer.
+To fine-tune the model on our data, we'll use dynamic learning rate, normilzation and augmentation
 
-First, we'll set up the [`TrainingArguments`](https://huggingface.co/docs/transformers/main_classes/trainer#transformers.TrainingArguments). This defines all training hyperparameters, such as learning rate and the number of epochs, frequency to save the model and so on.
 
 
 ```python
-from transformers import TrainingArguments
+from tensorflow.keras.callbacks import LearningRateScheduler
 
-epochs = 50
+def lr_schedule(epoch):
+    """
+    A function that takes an epoch index as input and returns a new learning rate
+    for that epoch. This function can be customized to implement various schedules,
+    such as step decay or exponential decay.
+    """
+    lr = 0.001
+    if epoch > 10:
+        lr *= 0.1
+    elif epoch > 20:
+        lr *= 0.01
+    return lr
+
+lr_scheduler = LearningRateScheduler(lr_schedule)
+
+def normalize(input_image, input_mask):
+    input_image = tf.image.convert_image_dtype(input_image, tf.float32)
+    input_image = (input_image - mean) / tf.maximum(std, backend.epsilon())
+    input_mask -= 1
+    return input_image, input_mask
+    
+    def load_image(datapoint, augment=True):
+    input_image = tf.image.resize(datapoint["image"], (image_size, image_size))
+    input_mask = tf.image.resize(
+        datapoint["segmentation_mask"],
+        (image_size, image_size),
+        method="bilinear",
+    )
+    if augment:
+        # Randomly flip the image horizontally
+        if tf.random.uniform(()) > 0.5:
+            input_image = tf.image.flip_left_right(input_image)
+            input_mask = tf.image.flip_left_right(input_mask)
+
+        # Randomly adjust the brightness and saturation of the image
+        input_image = tf.image.random_brightness(input_image, 0.1)
+        input_image = tf.image.random_saturation(input_image, 0.8, 1.2)
+
+    input_image, input_mask = normalize(input_image, input_mask)
+    input_image = tf.transpose(input_image, (2, 0, 1))
+
+    return {"pixel_values": input_image, "labels": tf.squeeze(input_mask)}
+
+```
+
+Next, we'll define a function that computes the evaluation metric we want to work with. Because we're doing semantic segmentation, we'll use the [mean Intersection over Union (mIoU)]
+
+
+```python
+def evaluate(model, dataset):
+    ious = []
+    for sample in dataset:
+        images, masks = sample["pixel_values"], sample["labels"]
+        pred_masks = model.predict(images).logits
+        pred_masks = create_mask(pred_masks)
+        masks = tf.image.resize(masks, (128, 128), method='bicubic')
+        masks = tf.expand_dims(masks[..., 0], axis=-1)
+        iou = calculate_iou(masks, pred_masks)
+        ious.append(iou)
+        mean_iou = tf.reduce_mean(ious)
+        return mean_iou
+
+mean_iou = evaluate(model, test_ds)
+print("Mean IoU:", mean_iou.numpy())
+```
+
+Finally, we can instantiate a `training` object.
+
+
+```python
 lr = 0.00006
-batch_size = 2
+optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+model.compile(optimizer=optimizer)
 
-hub_model_id = "segformer-b0-finetuned"
+epochs = 30
 
-training_args = TrainingArguments(
-    "segformer-b0-finetuned-outputs",
-    learning_rate=lr,
-    num_train_epochs=epochs,
-    per_device_train_batch_size=batch_size,
-    per_device_eval_batch_size=batch_size,
-    save_total_limit=3,
-    evaluation_strategy="steps",
-    save_strategy="steps",
-    save_steps=20,
-    eval_steps=20,
-    logging_steps=1,
-    eval_accumulation_steps=5,
-    load_best_model_at_end=True,
-    push_to_hub=True,
-    hub_model_id=hub_model_id,
-    hub_strategy="end",
+history = model.fit(
+    train_ds,
+    validation_data=test_ds,
+    callbacks=[DisplayCallback(test_ds)],
+    epochs=epochs,
 )
 ```
 
-Next, we'll define a function that computes the evaluation metric we want to work with. Because we're doing semantic segmentation, we'll use the [mean Intersection over Union (mIoU)], directly accessible in the [`evaluate` library](https://huggingface.co/docs/evaluate/index).
-
-Because our model outputs logits with dimensions height/4 and width/4, we have to upscale them before we can compute the mIoU.
-
+during training we can see our prediction after each epoch using the callback implementation.
 
 ```python
-import torch
-from torch import nn
-import evaluate
+class DisplayCallback(tf.keras.callbacks.Callback):
+    def __init__(self, dataset, **kwargs):
+        super().__init__(**kwargs)
+        self.dataset = dataset
 
-metric = evaluate.load("mean_iou")
-
-def compute_metrics(eval_pred):
-  with torch.no_grad():
-    logits, labels = eval_pred
-    logits_tensor = torch.from_numpy(logits)
-    # scale the logits to the size of the label
-    logits_tensor = nn.functional.interpolate(
-        logits_tensor,
-        size=labels.shape[-2:],
-        mode="bilinear",
-        align_corners=False,
-    ).argmax(dim=1)
-
-    pred_labels = logits_tensor.detach().cpu().numpy()
-    # currently using _compute instead of compute
-    # see this issue for more info: https://github.com/huggingface/evaluate/pull/328#issuecomment-1286866576
-    metrics = metric._compute(
-            predictions=pred_labels,
-            references=labels,
-            num_labels=len(id2label),
-            ignore_index=0,
-            reduce_labels=feature_extractor.do_reduce_labels,
-        )
-    
-    # add per category metrics as individual key-value pairs
-    per_category_accuracy = metrics.pop("per_category_accuracy").tolist()
-    per_category_iou = metrics.pop("per_category_iou").tolist()
-
-    metrics.update({f"accuracy_{id2label[i]}": v for i, v in enumerate(per_category_accuracy)})
-    metrics.update({f"iou_{id2label[i]}": v for i, v in enumerate(per_category_iou)})
-    
-    return metrics
-```
-
-Finally, we can instantiate a `Trainer` object.
-
-
-```python
-from transformers import Trainer
-
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_ds,
-    eval_dataset=test_ds,
-    compute_metrics=compute_metrics,
-)
-```
-
-Now that our trainer is set up, training is as simple as calling the `train` function. We don't need to worry about managing our GPU(s), the trainer will take care of that.
-
-
-```python
-trainer.train()
-```
-
-When we're done with training, we can push our fine-tuned model and the feature extractor to the Hub.
-
-This will also automatically create a model card with our results. We'll supply some extra information in `kwargs` to make the model card more complete.
-
-
-```python
-kwargs = {
-    "tags": ["vision", "image-segmentation"],
-    "finetuned_from": pretrained_model_name,
-    "dataset": hf_dataset_identifier,
-}
-
-feature_extractor.push_to_hub(hub_model_id)
-trainer.push_to_hub(**kwargs)
+    def on_epoch_end(self, epoch, logs=None):
+        clear_output(wait=True)
+        show_predictions(self.dataset)
+        print("\nSample Prediction after epoch {}\n".format(epoch + 1))
 ```
 
 
 # 4. Conclusion
 
-That's it! You now know how to create your own image segmentation dataset and how to use it to fine-tune a semantic segmentation model.
+That's it! We have have trained and fined tuned the model, Thank you
